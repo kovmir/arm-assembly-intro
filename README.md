@@ -1,0 +1,973 @@
+# Introduction
+
+Welcome to this beginner's introduction to ARM assembly. Unlike other guides, I
+will not duplicate the official documentation, but rather equip you with the
+basics needed to navigate it confidently on your own. Topics already
+well-covered by ARM, like SIMD programming, are skipped, as is anything likely
+to change or become obsolete.
+
+Most of the concepts taught are not ARM-specific but apply to other
+architectures. ARM is chosen as an example ISA because it is ubiquitous,
+arguably the most relevant architecture, and is likely to remain relevant for
+the foreseeable future.
+
+# Prerequisites
+
+Basic C and Linux knowledge is needed, and you must be able to set breakpoints
+and step through code in GNU Debugger. You know enough C and Linux if you can
+understand [this project][battnotify_repo] and feel comfortable working with
+the terminal.
+
+You also need any ARM computer with 64-bit Linux on board to run the code.
+Single-board computers like [ROCKPro64][rockpro64], [Raspberry Pi
+3/4/5][rpi_products], or [BPI-M5][bpim5] will do.
+
+# Basics
+
+This is how arithmetic works in ARM:
+
+```asm
+; ARM ARITHMETICS DEMO
+; We add 10 to 7 and save the result.
+mov x1, #7       ; Save 7 into register x1.
+add x2, x1, #10  ; Add 10 to the contents of x1 and save the result in x2.
+                 ; x2 is now 17.
+```
+
+`x0`, `x1`, `x2` ... `x30` are places where we store data, very much like
+variables in C; they are called general purpose registers. `mov` places `7`
+into `x1` register, the hash sign indicates 7 is a number. `add` adds 10 to the
+contents of `x1` and saves the result in `x2`.
+
+We say `mov` and `add` are [opcodes][a64_opcodes] followed by operands,
+e.g. `add` opcode is followed by three operands: `x2`, `x1`, and `#10`. An
+opcode, together with its operands, forms an instruction. In practice, the
+terms "opcode" and "instruction" are interchangeable.
+
+Install GCC, save the code as `hello.s`, and compile it with `gcc -nostdlib
+hello.s -o hello`. `-nostdlib` says we do not need the standard C library.
+
+Try to run the executable `./hello` and observe the output:
+
+```
+[1]    2384 illegal hardware instruction  ./hello
+```
+
+When you run the program, it is loaded into memory (RAM) and the execution
+begins sequentially from top to bottom. `mov` is executed first, then `add`,
+and then whatever random byte sequence happens to reside next in memory. This
+random byte sequence causes `illegal hardware instruction` error.
+
+To fix the crash, we have to terminate the execution at the end of the program.
+There is no exit opcode, we have to ask the operating system to do it for us.
+The exit concept is nonexistent in assembly, because a CPU can only execute a
+particular list of instructions, a CPU cannot "exit" from anything. Exit has
+meaning to the OS: "take this process off the CPU's schedule." The same applies
+to file I/O, symlinks, chroot, dynamic memory allocation, etc. Whenever you ask
+something from the operating system, that means you are issuing a syscall
+(short for "system call"). Here is how to do it:
+
+```asm
+; EXIT SYSCALL DEMO
+mov x1, #7
+add x2, x1, #10
+
+; The operating system expects to see the ID of the operation in x8.
+; 93 means exit, we will see later where this number comes from.
+mov x8, #93
+; The exit operation expects x0 to hold the exit code.
+; Let us use the result of the previous calculation.
+mov x0, x2
+; Transfer the execution to the operating system.
+svc #666 ; #666 has no effect, because Linux ignores this value.
+         ; Even though Linux ignores it, it has to be there as it is part of the instruction.
+         ; Other operating systems may somehow react to it.
+```
+
+Linux syscalls and their arguments are listed in [syscalls(2)][man_syscalls2],
+but you may find [arm64.syscall.sh][a64_syscalls] more convenient. Follow the
+link and try to find the above exit syscall; verify the arguments.
+
+Compile and run the program again, it no longer crashes. Run `echo $?` to see
+the exit code is indeed 17.
+
+GCC complains it cannot find `_start` during compilation:
+
+```
+/usr/bin/ld: warning: cannot find entry symbol _start; defaulting to 0000000000000244
+```
+
+We have not specified where the code execution begins, so GCC has to guess. To
+prevent the guessing, add `_start:` where needed:
+
+```asm
+; _START LABEL DEMO 1
+_start:
+	mov x1, #7
+	add x2, x1, #10
+
+	mov x8, #93
+	mov x0, x2
+	svc #0
+```
+
+If you recompile and run, the error does not go away. This is because `_start`
+has to be `.global` to be visible from outside of the program (to the OS):
+
+```asm
+; _START LABEL DEMO 2
+_start:
+	mov x1, #7
+	add x2, x1, #10
+
+	mov x8, #93
+	mov x0, x2
+	svc #0
+
+.global _start
+```
+
+Compile and run again, the warning goes away.
+
+To truly understand what this is all about, try to break things; e.g. try to
+move `.global _start` or `_start:` and see what happens. [ADD
+(immediate)][a64_addimm] documentation reveals 12 bits of the instruction are
+used to encode the immediate (number literal), which gives a maximum value of
+2^12 - 1 = 4095:
+
+![ADD (immediate)](addimm.png)
+
+Try to assemble `add x0, x1, #5093`; see the error. Try `#4096`.
+
+## Memory & Sections
+
+31 64-bit CPU registers are not enough to hold all the data, which
+is why we have memory. ARM instructions do not process data in memory directly;
+you must load the data into the registers first. Use `ldr` to load from memory:
+
+```asm
+; LOAD FROM MEMORY DEMO
+.global _start
+_start: ; Global, marks where execution begins.
+	mov x8, #93
+	ldr x0, exit_code ; Load 8 bytes from where exit_code points to.
+	add x0, x0, #5    ; We can now process it somehow, like add 5 to it.
+	svc #0
+
+; Label the place with allocated memory.
+exit_code: ; Not global, used internally.
+	; .quad reserves 8 bytes in memory,
+	; other options will be explored later.
+	.quad 15 ; Store decimal 15.
+```
+
+Assembly code can be subdivided into sections that reside in different memory
+regions and have different constraints applied to them: the data section cannot
+be executed, and the code section cannot be modified. Here is how to declare
+sections:
+
+```asm
+; CODE SECTIONS DEMO
+; Executable code resides in .text
+.section .text
+.global _start
+_start:
+	mov x8, #93
+	ldr x0, exit_code
+	svc #0
+
+; Read-only data resides in .rodata
+.section .rodata
+exit_code:
+	.quad 15
+
+; Other sections will be explored further down.
+```
+
+Try to write into `.rodata` memory address to see the program crash:
+
+```asm
+; MODIFY READ-ONLY SECTION SEGFAULT DEMO
+; Executable code resides in .text
+.section .text
+.global _start
+_start:
+	mov x0, #6
+	; Load the memory address mydata points to.
+	adr x1, mydata
+
+	; Store x0 in memory where x1 points to.
+	;
+	; [] are a dereference operator,
+	; meaning take memory address stored in x1,
+	; and store x0 there.
+	str x0, [x1]
+	; ^ this str will result in segmentation fault.
+
+
+; Read-only data resides in .rodata
+.section .rodata
+mydata:
+	.quad 15
+```
+
+If you run the above code, it will crash due to a segmentation fault, meaning
+the program accesses memory it is not allowed to access. Writing to `.rodata`
+is illegal.
+
+Turn `.rodata` into `.data`, you can then modify the values held within
+the section:
+
+```asm
+; WRITE INTO DATA SECTION DEMO
+.section .text
+.global _start
+_start:
+	mov x0, #6
+	adr x1, mydata
+
+	str x0, [x1] ; No segfault
+
+	mov x8, #93
+	mov x0, #0
+	svc #0 ; Exit
+
+.section .data ; Not .rodata; writing is legal.
+mydata:
+	.quad 15
+```
+
+`.data` section is for initialized memory, whereas `.bss` section is for
+uninitialized memory. `.bss` is a way to preallocate memory. These correspond
+to initialized and uninitialized global/static C variables. Here is how to use
+it:
+
+```asm
+; BSS SECTION DEMO
+; ...
+	adr x1, buffer ; Take buffer address.
+	mov x2, #0x41
+	str x2, [x1]   ; Store x2 at [x1].
+
+	; ...
+
+.section .bss
+buffer:
+	.zero 8  ; .allocate 8 byte in .bss (zero-initialized)
+```
+
+Unlike `.data`, `.bss` section cannot be given initial value except 0.
+
+`.data`, `.rodata`, and `.bss` are known as static memory—allocated at the
+start of execution, and the *amount of it* stays constant throughout.
+
+# Hello World
+
+Now that you understand sections, you are ready to greet the World:
+
+```asm
+; ARM HELLO WORLD DEMO
+.section .text
+.global _start
+_start:
+	; print mesage
+	mov x8, 0x40 ; write syscall id
+	mov x0, #1 ; stdout file descriptor
+	adr x1, message ; load message address
+	mov x2, #12 ; string length
+	svc #0
+
+	; exit with status code
+	mov x8, 0x5d ; exit syscall
+	mov x0, #0 ; status code
+	svc #0
+
+.section .rodata
+message:
+	.ascii "Hello, ARM!\n"
+```
+
+Compile the above code with `gcc -g -nostdlib /path/to/code.s -o helloworld`
+and start a GDB session with `gdb ./helloworld`. In the GDB session type:
+
+```
+layout asm
+break _start
+run
+```
+
+`adr` opcode loads the address where `"Hello, ARM!\n"` resides. If you follow
+the memory address next to the opcode, you can only see garbage. This is
+because the debugger (disassembler) does not distinguish between code and data
+in memory. In other words, the string is there, but the debugger tries to
+interpret it as code. In GDB prompt type `x/12c <memory_address>` to ask GDB to
+interpret 12 bytes starting from the given memory address as characters:
+
+![GNU Debugger Data Demo](gdb_data.png)
+
+# Compiler & Assembler
+
+From [GCC compiler man page][man_gcc1]:
+
+```
+When you invoke GCC, it normally does preprocessing, compilation, assembly and
+linking.
+```
+
+That means when you invoke `gcc /path/to/program.c`, GCC runs 4 programs in
+sequence: preprocessor, compiler, assembler, and linker. Preprocessor edits C
+code (e.g. resolves `#ifdef`s), compiler rewrites C into assembly, assembler
+encodes the assembly instructions in binary format, and the linker combines
+object files into an executable. Assembly code does not need preprocessing and
+compilation. In other words, there is no need to invoke GCC; you can run the
+assembler and linker manually. Execute these commands for the manual control:
+
+```sh
+as -g -o helloworld.o helloworld.s
+ld -o helloworld helloworld.o
+```
+
+You may find this [Makefile][make_guide] useful:
+
+```make
+project = helloworld
+
+build:
+	as -g -o $(project).o $(project).s
+	ld $(LDFLAGS) -o $(project) $(project).o
+
+gdb:
+	gdb ./$(project)
+
+clean:
+	rm -f $(project) $(project).o
+
+.PHONY: build gdb clean
+```
+
+Using GCC is fine, just be aware of the underlying process. GCC may optimize
+(rewrite) your code, add `-O0` flag to prevent it.
+
+Also note you can ask GCC to rewrite your C in assembly: `gcc -S -fverbose-asm
+/path/to/c/file.c`.
+
+# Position Independent Executable
+
+Read [adr instruction][a64_adr] description:
+
+```
+This instruction adds an immediate value to the PC value to form a PC-relative
+address, and writes the result to the destination register.
+```
+
+PC is Program Counter, it is a register that holds the address of the next
+instruction to be executed. Start a GDB session and see how PC register value
+changes every time you step through the code:
+
+![GNU Debugger PC Demo](gdb_pc.gif)
+
+An immediate value is a number literal (constant). During execution this
+instruction reads the current PC value and adds the immediate to it. This
+immediate is the *distance* in bytes to the given address from the current
+instruction (PC value).
+
+If the assembler encodes the absolute memory address, the code must be loaded
+at that address every time it is executed. If you move the code, the fixed
+absolute address no longer points to the data.
+
+`adr` reads PC value and adds the distance to `message` in bytes. the assembler
+does not bake in the absolute `message` address, it bakes the *distance* from
+`adr` to `message` into the binary:
+
+```asm
+; ADR INSTRUCTION DEMO
+; ...
+	; Add the offset, the distance to message label, to the current PC value
+	; to compute the absolute message label address at run time.
+	adr x1, message
+	; ...
+
+.section .rodata
+message:
+	.ascii "Hello, ARM!\n"
+```
+
+To see this in action, compile Hello ARM code using the above `Makefile` and
+run GDB:
+
+```sh
+make LDFLAGS=-pie
+make gdb
+```
+
+In a GDB session:
+
+```
+set disable-randomization off
+layout asm
+break _start
+run
+run
+run
+...
+```
+
+![GNU Debugger ASLR Demo](gdb_aslr.gif)
+
+Every time you invoke `run`, notice how the memory layout changes but the code
+is still able to reach the data. This is precisely because the encoded `adr`
+instruction stores the distance—not the location—from `adr` to the data. It
+looks like the address next to `adr` changes, but actually doesn't; that's GDB
+resolving the absolute address for us. *This works because even though the
+memory addresses change, the relative distances across code and data are
+constant, i.e. the string is always the same distance away from `adr`.*
+
+Consider [`adr` encoding][a64_adr], 21 bytes `immhi:immlo` are used to encode
+the offset in bytes, which gives +/-1MiB range away from PC; too little
+sometimes. [`adrp` instruction][a64_adrp] allows PC-relative addressing
++/-4GiB. `adrp` subdivides memory into 4KiB aligned regions—called pages—and
+encodes the distance in the amount of 4K pages (not bytes, like `adr`):
+
+```asm
+; ADRP INSTRUCTION DEMO
+; ...
+	adrp x1, message ; x1 now points to the page with the data.
+	add x1, x1, :lo12:message ; x1 now points to the data.
+
+.section .rodata
+message:
+	.ascii "Hello, ARM!\n"
+```
+
+Here is a diagram to help you understand:
+
+```
+MEMORY:
+
+0xaab42a5f0000       0xaab42a5f1000       0xaab42a5f2000       0xaab42a5f3000
+|                    |                    |                    |          ^^^
+|        4096        |         4K         |         4K         |          |
+|<------------------>|<------------------>|<------------------>|        Aligned
+|                    |                    |  0x264             |
+|         adrp       |                    |<------->message:   |
+          ^                                         ^
+          |                 Distance constant       |
+          0xaab42a5f024c<-------------------------->0xaab42a5f2264
+
+ALGORITHM:
+
+adrp x1, message
+  0xaab42a5f024c                                (PC)
+  0xaab42a5f0000                                (Current page address)
+             ^^^
+  0xaab42a5f2000 = 0xaab42a5f0000 + 2*4096 = x1 (Message page address)
+            ^                       ^ offset
+
+add x1, x1, :lo12:message
+  0xaab42a5f2264 = 0xaab42a5f2000 + 0x264 = x1 (Message address)
+```
+
+Recompile `adrp` version of Hello World, and start a similar GDB session to
+verify position independence of this code:
+
+![GNU Debugger ADRP Demo](gdb_adrp.gif)
+
+All [`adrp`][a64_adrp] details come from the official ARM documentation:
+
+![ADRP](adrp.png)
+
+Notice that ARM gives instruction descriptions both in words and in pseudocode.
+The offset is split into two parts, `immhi` and `immlo`, which are then
+combined and shifted left by 12: `immhi::immlo::Zeros{12}`. Each left shift of
+a binary number is equivalent to multiplication by 2. `SignExtend` adds missing
+zeros on the left to make it a 64-bit value (preserving the sign).
+`PC64()[63:12]` means we take bits [63:12] from PC and discard the rest, then
+shift left by 12: `::Zeros{12}`. `X{64}(d) = base + imm` means we add the
+offset to PC and save the result in the 64-bit destination register. ARM
+pseudocode is documented as well, but most of it should be clear to a C
+programmer. A typical CPU lifecycle consists of three steps: fetch, decode, and
+execute instructions. The first pseudocode snippet explains what happens while
+the instruction is being decoded, and the second describes instruction
+execution.
+
+# Stack
+
+I assume you are familiar with the stack data structure. Apart from registers
+and static memory, the stack is available to hold temporary data. `sp` register
+holds the address of the top of the stack:
+
+```asm
+; STACK DEMO 1
+; Push onto stack (save data).
+mov x0, #42
+sub sp, sp, #16 ; Subtract 16 bytes first; allocate memory.
+str x0, [sp]    ; Store x0; sp holds a memory address, use [] to dereference.
+
+mov x0, #63 ; Overwrite x0.
+; ...
+
+; Pop from stack.
+ldr x0, [sp]   ; Retrieve data.
+; x0 is now 42 again.
+add sp, sp, #16 ; Add 16 bytes after; deallocate memory.
+```
+
+In ARM, the stack grows top to bottom, i.e. from high to low memory addresses;
+that is why you subtract to add data. Stack (de)allocations in ARM must be in
+multiples of 16. Here is the equivalent code, but simpler (read about [ARM
+addressing modes][a64_ldrstr] for details):
+
+```asm
+; STACK DEMO 2
+mov x0, #42
+; Though x0 is 8 bytes in size, by design we must allocate multiples of 16.
+str x0, [sp, #-16]! ; Push
+
+; ...
+
+ldr x1, [sp], #16 ; Pop
+```
+
+Run the following code, then try to misalign the stack, see what happens:
+
+```asm
+; STACK DEMO 3
+.section .text
+.global _start
+
+_start:
+	mov x1, #42
+	str x1, [sp, #-16]! ; push
+
+	mov x1, #0xf7
+
+	ldr x1, [sp], #16 ; pop
+
+	mov x8, #93
+	mov x0, x1
+	svc #0 ; exit
+```
+
+Read [Using the Stack in AArch64: Implementing Push and Pop][a64_stackusage]
+for more detailed examples.
+
+# Branching
+
+There are no C-like function calls in assembly; there are branch instructions
+to jump to different locations. Use `b` to branch (jump) to a different
+address:
+
+```asm
+; BRANCHING DEMO
+.section .text
+.global _start
+_start:
+	mov x1, #1
+	b my_func ; go to my_func
+ret_addr:
+	mov x8, 0x5d
+	mov x0, x1
+	svc #0 ; exit with 15 code
+
+my_func:
+	mov x1, #15 ; overwrite x1
+	b ret_addr ; go to ret_addr
+```
+
+If `sub` instruction simply performs subtraction, `subs` subtracts and reports
+additional information about the outcome, such as whether the result is
+negative or zero. The same holds for `adds` and a few others. `subs` and the
+like report the result by setting the appropriate bit in [`NZCV`
+register][nzcvreg]:
+
+```asm
+; SUBS AND CONDITIONAL BRANCHES DEMO
+.section .text
+.global _start
+_start:
+	mov x0, #4
+	mov x1, #66
+
+	subs x0, x0, #2
+	b.eq my_func ; x0 != 0, no jump.
+	subs x0, x0, #2
+	b.eq my_func ; x0 == 0, jump.
+
+exit:
+	mov x8, 0x5d
+	mov x0, x1 ; Guess the value of x1.
+	svc #0
+
+my_func:
+	add x1, x1, #1
+	b exit
+```
+
+`cmp` compares registers and reports to `NZCV` register in a similar fashion:
+
+```asm
+; CMP INSTRUCTION DEMO
+cmp x0, x1
+b.ne some_label ; Branch if Z (zero) flag is not set, i.e. x0 != x1.
+```
+
+`NZCV` is not a general purpose register, use `mrs` and `msr`:
+
+```asm
+; NZCV REGISTER ACCESS DEMO
+mrs x0, nzcv ; Read from NZCV.
+msr nzcv, x0 ; Write to NZCV.
+```
+
+`info registers` in a GDB session displays CPU register values. Be aware that
+`NZCV` is part of `CPSR` register in GDB. This is due to the changes in the
+recent ARM ISA specifications.
+
+The following branching method resembles function calls in C-like languages.
+Save the return address to `x30` and branch, then get the address from `x30` to
+branch back:
+
+```asm
+; FUNCTION CALLS DEMO
+.section .text
+.global _start
+_start:
+	mov x0, #4
+
+	; Set x30 to PC+4, then branch to my_func.
+	; x30 now holds the return address.
+	bl my_func
+
+	; `ret` branches here.
+	mov x8, 0x5d
+	svc #0 ; exit
+
+
+my_func:
+	add x0, x0, #1
+	ret ; x30 must not be overwritten for this to work.
+```
+
+`bl` uses `x30` to save the return address; for this reason, `x30` is also
+referred to as the link register.
+
+Consider `b.eq` once again, EQ is not the only option, the pattern is
+[`b.CONDITION`][a64_bcond]:
+
+![B.cond](bcond.png)
+
+Click [`ConditionHolds`][a64_condholds] to open the function definition and see
+the meaning of conditionals:
+
+![ConditionHolds](conditionholds.png)
+
+`b.eq` branches when the Z flag is 1; `b.ne` does the opposite, i.e. it
+branches when Z is 0. It is the same with the others. [NZCV register
+page][nzcvreg] explains when the flags are set:
+
+![NCZV Register](nzcv.png)
+
+You can ask online search engines to look specifically at ARM's website if you
+add `site:arm.com` to your request. Note that not all the documentation is
+available in HTML format; most of it is in PDF.
+
+# Calling Convention
+
+For your code to interface with other people's code in C or assembly, everyone
+must follow the calling convention. You follow the convention placing a syscall
+number in `x8`, where the operating system expects to find it. `x0` ... `x7`
+are used to pass arguments and return values to/from other functions. `x9` ...
+`x15` can be freely used, `x19` ... `x28` must be preserved. "Must be
+preserved" means you are free to use them, but make sure you restore the
+original values before the function return. Refer to [ARM Architecture
+Procedure Call Standard (AAPCS64)][a64_pcs] for the remaining details:
+
+![AAPCS64](aapcs64.png)
+
+Here is a little demo to illustrate the concept:
+
+```asm
+; ARM CALLING CONVENTION DEMO
+; Compile with `gcc /path/to/file.s`.
+.section .rodata
+msg:
+	; .asciz is a NULL-terminated string.
+	.asciz "Hello from assembly! The answer is %d.\n"
+
+.section .text
+.global main
+; The C standard library provides its own `_start` to prepare the environment,
+; which then calls `main`.
+main:
+	; Here it does not matter what these are; what matters is that we have
+	; to follow the calling convention saving these.
+	stp x29, x30, [sp, #-16]! ; Save them on stack.
+	; x29 must point to the current stack frame by convention.
+	; Stack frame is the stack segment used by the current function,
+	; x29 is used by debuggers to provide a backtrace, `bt` in GDB.
+	mov x29, sp
+
+	; Populate registers with data so we can see whether it persists.
+	; The sum of these register values will be the exit code. If the exit
+	; code is 7 + 3 + 5 = 15, then the values persist.
+	mov x10, #7
+	mov x11, #3
+	mov x21, #5
+
+	; Prepare printf arguments...
+	; x0 = string address (1st printf arg).
+	adrp x0, msg
+	add  x0, x0, :lo12:msg
+	; x1 = integer for %d (2nd printf arg).
+	mov x1, #42
+
+	; printf function may corrupt registers x9 .. x15, always assume it
+	; will. Suppose we care about x10 and x11, we can save their values on
+	; stack and restore them after the function call.
+	stp x10, x11, [sp, #-16]!
+	bl  printf
+	; x10 and x11 are corrupt at this point, restore their values from stack.
+	ldp x10, x11, [sp], #16
+
+	; x19 .. x28 must remain untouched after the function returns.
+
+	; Prepare the exit code.
+	; x0 holds the function return value by convention;
+	; main() return value in this case.
+	add x0, x10, x11
+	add x0, x0, x21
+
+	; The following code line restores the previously saved register
+	; values.
+	ldp x29, x30, [sp], #16
+
+	ret
+```
+
+Consider C Hello World `main()` disassembly:
+
+```c
+/* Compile with     `gcc /path/to/file.c` */
+/* Disassemble with `objdump -d ./a.out`  */
+#include <stdio.h>
+
+int
+main(void)
+{
+	printf("Hello, World!\n");
+}
+```
+
+The compiler preserves `x29` and `x30`, `x0` holds the first `printf()`
+argument:
+
+```
+00000000000007a8 <main>:
+ 7a8:	a9bf7bfd 	stp	x29, x30, [sp, #-16]!
+ 7ac:	910003fd 	mov	x29, sp
+ 7b0:	90000000 	adrp	x0, 0 <_init-0x5d0>
+ 7b4:	911fa000 	add	x0, x0, #0x7e8
+ 7b8:	97ffffa6 	bl	650 <puts@plt>
+ 7bc:	52800000 	mov	w0, #0x0                   	// #0
+ 7c0:	a8c17bfd 	ldp	x29, x30, [sp], #16
+ 7c4:	d65f03c0 	ret
+```
+
+Let us see how to interface C and assembly code:
+
+```c
+/* candasm.c */
+#include <stdio.h>
+
+int my_func(int a, int b);
+
+int main()
+{
+	int a = 4;
+	int b = 5;
+	int result = my_func(a, b);
+	printf("Calling assembly function my_function "
+		"with x0=%d and x1=%d results in %d\n", a, b, result);
+	return 0;
+}
+```
+
+```asm
+; func.s
+.section .text
+; my_func has to be visible outside of this file.
+.global my_func
+my_func:
+	; Arguments are in x0 and x1.
+	add x0, x0, x1
+	ret ; x0 contains the return value.
+```
+
+Compile the above project with `gcc /path/to/c/file.c /path/to/asm/file.s`, or
+leverage the following `Makefile`:
+
+```make
+# Makefile
+CC      = gcc
+AS      = as
+CFLAGS  = -c -g -Wall
+ASFLAGS = -g
+
+# Executable name
+TARGET  = candasm
+
+# Save the code as candasm.c and func.s files.
+OBJ = candasm.o func.o
+
+all: $(TARGET)
+
+$(TARGET): $(OBJ)
+	$(CC) -o $(TARGET) $(OBJ)
+
+%.o: %.c
+	$(CC) $(CFLAGS) $< -o $@
+
+%.o: %.s
+	$(AS) $(ASFLAGS) $< -o $@
+
+clean:
+	rm -f $(OBJ) $(TARGET)
+
+.PHONY: all clean
+```
+
+This is what a factorial function implementation would look like:
+
+```asm
+; ARM FACTORIAL DEMO
+my_fact:
+	mov x1, x0 ; x0 will hold the return value
+	mov x0, #1 ; x0 = result, start from 1
+	cbz x1, 2f ; 0! == 1, return 1
+1:
+	mul x0, x0, x1 ; multiply
+	subs x1, x1, 1 ; subtract 1
+	b.ne 1b ; keep multiplying until 0
+2:
+	ret
+```
+
+[`cbz`][a64_cbz] is a conditional jump. `2f` refers to the label
+`2:` below, whereas `1b` refers to the label `1:` above.
+
+# Exercise
+
+Implement [strnlen(3)][strnlen3] from the standard C library in ARM assembly
+and call it from C code.
+
+# ARM Nomenclature
+
+ARM is a *family* of [Instruction Set Architectures][armglossary_isa] (ISA).
+Basically, an *ISA*, among other things, is a set of instructions and
+registers. [ARM family consists of three ISAs: A64, A32 and
+T32][arm_familyisas]. This article covers A64. Unlike A32, A64 has wider
+registers and thus more addressable memory. All A64 and A32 instructions are
+32-bit wide, whereas T32 allows mixed 16- and 32-bit instructions. This is
+usually desired in microcontrollers, where [flash storage][wiki_nvm] for code
+is limited. Thumb and Thumb-2 are older names for T32.
+
+ARM combines ISAs with many other requirements to define *architectures* like
+Armv8-M, Armv8.4-A, or Armv9-A. For example, separate registers and
+instructions for floating-point numbers are optional in Armv7 but mandatory in
+Armv8. The numbers are the [architecture version][arm_isaversions], while the
+letters A, M, and R at the end refer to the [architecture
+profile][arm_isaprofiles]. The A profile is optimized for performance to run
+full-scale operating systems. The M profile is for low-power devices, like
+microcontrollers. The R profile is equipped with additional fault-tolerance
+features needed in critical environments like the automotive and aerospace
+industries.
+
+ARM architectures, combined with additional requirements, form *cores*. Cores
+define cache hierarchy, debug interfaces, peripheral interconnections and so
+on; they can be viewed as CPU core blueprints. ARM designs cores like
+[Cortex-A76][arm_cortexa76] and sells to other companies the right to
+manufacture them. ARM also sells the right to design your own cores that
+implement ARM architectures.
+
+An ARM core may support more than one ISA, so a core executing A64 instructions
+is said to run in AArch64 [*execution state*][arm_execstates], while a core
+executing A32 or T32 instructions is said to run in AArch32.
+
+## SoCs
+
+[Raspberry Pi 5 features four Arm Cortex-A76 cores][rpi5_databrief], but the
+chip is labeled Broadcom BCM2712. This is because Broadcom licensed Cortex-A76
+from ARM and integrated it into *a single chip* with other peripherals, known
+as [SoC (system-on-a-chip)][armglossary_soc]:
+
+```
++------------------------------+
+| BCM2712                      |
+|  +------------+ +---------+  |
+|  | Cortex-A76 | | UART    |  |
+|  |            | |         |  |
+|  +------------+ +---------+  |
+|  +------------+ +---------+  |
+|  | etc.       | | USB     |  |
+|  |            | |         |  |
+|  |            | |         |  |
+|  +------------+ +---------+  |
+|                              |
++------------------------------+
+```
+
+In other words, four Cortex-A76 cores sit inside BCM2712 chip together with
+other circuits/peripherals.
+
+# Further Steps
+
+* Implement C standard library functions in ARM assembly.
+* Write programs in C and study the assembly code emitted by the compiler.
+* Learn to navigate the [official ARM documentation][arm_docs].
+* Read ARM's ["Learn the Architecture" guides][arm_archlearn].
+* See the [ARM Learning Paths][arm_learnpaths].
+* Visit the [ARM Books page][arm_books].
+* Buy an [STM32 Nucleo board][stm32_nucleo] and get into ARM microcontroller
+  programming.
+
+# License
+
+[CC BY-NC-ND 4.0][cc_byncnd40]
+
+![Developed by human](human_dev.gif)
+
+[a64_addimm]: https://support.arm.com/documentation/ddi0602/2026-06/Base-Instructions/ADD--immediate---Add-immediate-value-?lang=en
+[a64_adr]: https://support.arm.com/documentation/ddi0602/2026-06/Base-Instructions/ADR--Form-PC-relative-address-?lang=en
+[a64_adrp]: https://support.arm.com/documentation/ddi0602/2026-06/Base-Instructions/ADRP--Form-PC-relative-address-to-4KB-page-?lang=en
+[a64_bcond]: https://support.arm.com/documentation/ddi0602/2026-06/Base-Instructions/B-cond--Branch-conditionally-?lang=en
+[a64_cbz]: https://support.arm.com/documentation/ddi0602/2026-06/Base-Instructions/CBZ--Compare-and-branch-on-zero-?lang=en
+[a64_condholds]: https://support.arm.com/documentation/ddi0602/2026-06/Shared-Pseudocode/shared-functions-system?lang=en#func_ConditionHolds_1
+[a64_ldrstr]: https://support.arm.com/documentation/102374/0103/Loads-and-stores---addressing
+[a64_opcodes]: https://support.arm.com/documentation/ddi0602/2026-06/Base-Instructions?lang=en
+[a64_pcs]: https://github.com/ARM-software/abi-aa/blob/main/aapcs64/aapcs64.rst#6the-base-procedure-call-standard
+[a64_stackusage]: https://developer.arm.com/community/arm-community-blogs/b/architectures-and-processors-blog/posts/using-the-stack-in-aarch64-implementing-push-and-pop
+[a64_syscalls]: https://arm64.syscall.sh/
+[arm_archlearn]: https://www.arm.com/architecture/learn-the-architecture
+[arm_books]: https://www.arm.com/resources/education/books
+[arm_cortexa76]: https://support.arm.com/compute-ip/cortex-a76
+[arm_docs]: https://developer.arm.com/
+[arm_execstates]: https://support.arm.com/documentation/102412/0103/Execution-and-Security-states/Execution-states
+[arm_familyisas]: https://support.arm.com/documentation/dui0801/l/Overview-of-the-Armv8-Architecture?lang=en
+[arm_isaprofiles]: https://www.arm.com/architecture/cpu
+[arm_isaversions]: https://support.arm.com/documentation/102378/0201/What-do-Armv8-x-A-and-Armv9-x-mean-
+[arm_learnpaths]: https://learn.arm.com/
+[armglossary_isa]: https://www.arm.com/glossary/isa
+[armglossary_soc]: https://www.arm.com/glossary/soc-development
+[battnotify_repo]: https://github.com/kovmir/battnotify
+[bpim5]: https://docs.banana-pi.org/en/BPI-M5/BananaPi_BPI-M5
+[cc_byncnd40]: https://creativecommons.org/licenses/by-nc-nd/4.0/
+[make_guide]: https://makefiletutorial.com/
+[man_gcc1]: https://man.archlinux.org/man/gcc.1#DESCRIPTION
+[man_syscalls2]: https://man.archlinux.org/man/syscalls.2
+[nzcvreg]: https://support.arm.com/documentation/ddi0601/2026-06/AArch64-Registers/NZCV--Condition-Flags?lang=en
+[rockpro64]: https://pine64.org/devices/rockpro64/
+[rpi5_databrief]: https://pip-assets.raspberrypi.com/categories/892-raspberry-pi-5/documents/RP-008348-DS-6-raspberry-pi-5-product-brief.pdf
+[rpi_products]: https://www.raspberrypi.com/products/
+[stm32_nucleo]: https://www.st.com/en/evaluation-tools/stm32-nucleo-boards.html
+[strnlen3]: https://man.archlinux.org/man/strnlen.3
+[wiki_nvm]: https://en.wikipedia.org/wiki/Non-volatile_memory
