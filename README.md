@@ -60,8 +60,8 @@ random byte sequence causes `illegal hardware instruction` error.
 
 To fix the crash, we have to terminate the execution at the end of the program.
 There is no exit opcode, we have to ask the operating system to do it for us.
-The exit concept is nonexistent in assembly, because a CPU can only execute a
-particular list of instructions, a CPU cannot "exit" from anything. Exit has
+The exit concept is nonexistent in assembly because a CPU can only execute a
+particular list of instructions; it cannot "exit" from anything. Exit has
 meaning to the OS: "take this process off the CPU's schedule." The same applies
 to file I/O, symlinks, chroot, dynamic memory allocation, etc. Whenever you ask
 something from the operating system, that means you are issuing a syscall
@@ -79,7 +79,7 @@ mov x8, #93
 ; Let us use the result of the previous calculation.
 mov x0, x2
 ; Transfer the execution to the operating system.
-svc #666 ; #666 has no effect, because Linux ignores this value.
+svc #666 ; #666 has no effect because Linux ignores this value.
          ; Even though Linux ignores it, it has to be there as it is part of the instruction.
          ; Other operating systems may somehow react to it.
 ```
